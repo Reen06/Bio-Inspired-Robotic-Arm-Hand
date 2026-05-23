@@ -4,6 +4,7 @@ The old launcher (isaac_sim_launcher.py) does NOT use this module —
 it remains unchanged for backwards compatibility.
 """
 import json
+import os
 import select
 import socket
 import threading
@@ -16,6 +17,40 @@ IMAGE    = "nvcr.io/nvidia/isaac-sim:5.1.0"
 
 MANAGED_PREFIX = "isaac-sim-"   # containers created by Isaac-Sim-Manager
 LEGACY_NAME    = "isaac-sim"    # container created by the old launcher
+
+VOLUMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volumes.json")
+
+
+def create_volume(client, vol_name):
+    """Create a named Docker volume on the remote host. Returns True on success."""
+    _, _, code = run_cmd(client, f"docker volume create {vol_name}", timeout=10)
+    return code == 0
+
+
+def load_extra_mounts(inst_name):
+    """Return list of {vital, source, dest} dicts for this instance from volumes.json."""
+    try:
+        with open(VOLUMES_FILE) as f:
+            data = json.load(f)
+        return list(data.get(inst_name, []))
+    except Exception:
+        return []
+
+
+def save_extra_mounts(inst_name, mounts):
+    """Persist extra mounts list for an instance to volumes.json. Returns True on success."""
+    try:
+        try:
+            with open(VOLUMES_FILE) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data[inst_name] = mounts
+        with open(VOLUMES_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 # ── Port-forwarding (reused from original launcher) ───────────────────────────
@@ -196,9 +231,14 @@ def start_managed_instance(client, short_name, srv_mounts=None):
     vol_flags = " ".join(f"-v {v}:{p}:rw" for v, p in inst_vols)
     vol_flags += f" -v {shared_vol}"
 
-    if srv_mounts:
-        for host_path, cpath in srv_mounts:
-            vol_flags += f" -v {host_path}:{cpath}:rw"
+    # Merge caller-supplied mounts with any saved in volumes.json
+    cfg_mounts = load_extra_mounts(f"{MANAGED_PREFIX}{short_name}")
+    combined   = list(srv_mounts) if srv_mounts else []
+    for e in cfg_mounts:
+        combined.append((e["source"], e["dest"]))
+
+    for host_path, cpath in combined:
+        vol_flags += f" -v {host_path}:{cpath}:rw"
 
     cmd = (
         f'docker run --name isaac-sim-{short_name} '

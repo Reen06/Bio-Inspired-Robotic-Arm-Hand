@@ -13,8 +13,10 @@ import threading
 import paramiko
 
 from backend import (
-    SSH_HOST, connect, run_cmd, list_instances, stop_container, start_container,
+    SSH_HOST, MANAGED_PREFIX,
+    connect, run_cmd, list_instances, stop_container, start_container,
     remove_container, start_managed_instance, run_tunnel_server, check_ready,
+    create_volume, load_extra_mounts, save_extra_mounts,
 )
 
 SCRIPT_DIR   = os.path.dirname(os.path.realpath(__file__))
@@ -420,6 +422,50 @@ def login_screen(scr, host):
         return None
     return user, pw
 
+# ── Volume helpers ─────────────────────────────────────────────────────────────
+
+def _volume_type_menu(scr):
+    """Prompt the user to pick vital (Docker named volume) or non-vital (bind mount).
+    Returns 'vital', 'bind', or None if cancelled."""
+    opts = [
+        ("vital", "● Vital  (Docker named volume — persistent, per-instance)"),
+        ("bind",  "○ Non-vital  (bind mount — host path on the remote server)"),
+    ]
+    h, w = scr.getmaxyx()
+    dh   = len(opts) + 4
+    dw   = min(62, w - 4)
+    win  = curses.newwin(dh, dw, (h - dh) // 2, (w - dw) // 2)
+    win.keypad(True)
+    sel  = 0
+
+    while True:
+        win.erase()
+        border(win, "Volume Type")
+        for i, (_, label) in enumerate(opts):
+            attr   = C_SEL() if i == sel else C_DIM()
+            prefix = "▶ " if i == sel else "  "
+            safe(lambda i=i, l=label[:dw - 6], a=attr, p=prefix:
+                 win.addstr(2 + i, 2, f"{p}{l}", a))
+        safe(lambda: win.addstr(dh - 1, 2, " ESC cancel ", C_DIM()))
+        win.refresh()
+        key = win.get_wch()
+        if key == curses.KEY_UP and sel > 0:
+            sel -= 1
+        elif key == curses.KEY_DOWN and sel < len(opts) - 1:
+            sel += 1
+        elif key in ('\n', '\r', 10, 13, curses.KEY_ENTER):
+            return opts[sel][0]
+        elif key in ('\x1b', 27, 'q', 'Q'):
+            return None
+
+
+def _recreate_container(ssh, short_name):
+    """docker rm + relaunch a stopped managed container (extra mounts auto-loaded from config)."""
+    name = f"{MANAGED_PREFIX}{short_name}"
+    run_cmd(ssh, f"docker rm {name}", timeout=30)
+    return start_managed_instance(ssh, short_name)
+
+
 # ── Volume browser ─────────────────────────────────────────────────────────────
 
 _VCOL_KIND = 2
@@ -429,14 +475,20 @@ _VCOL_DEST = 48
 def show_volumes_ssh(scr, ssh, inst):
     """
     List and manage Docker volumes for a remote container.
-    Mounts are split into two labelled sections:
-      VITAL  — named Docker volumes (container's own persistent data)
-      SHARED — bind mounts from the host (optional extra content)
+
+    Sections:
+      VITAL    — named Docker volumes (container's own persistent data)
+      SHARED   — bind mounts currently active on the container
+      PENDING  — extra mounts saved in volumes.json not yet applied
+
+    Keys: [a] add  [d] delete  [R] recreate container  [r] refresh  [q] back
     """
-    name    = inst["name"]
-    running = inst["state"].lower() == "running"
-    msg     = ""
-    sel     = 0   # index into selectable items only
+    name       = inst["name"]
+    running    = inst["state"].lower() == "running"
+    is_managed = inst.get("is_managed", False)
+    short_name = name[len(MANAGED_PREFIX):] if is_managed else None
+    msg        = ""
+    sel        = 0
 
     def load_items():
         out, _, code = run_cmd(
@@ -451,21 +503,35 @@ def show_volumes_ssh(scr, ssh, inst):
             except json.JSONDecodeError:
                 pass
 
-        vital = [m for m in raw if m.get("Type") == "volume"]
-        extra = [m for m in raw if m.get("Type") == "bind"]
+        vital_mounts = [m for m in raw if m.get("Type") == "volume"]
+        bind_mounts  = [m for m in raw if m.get("Type") == "bind"]
+
+        # Build set of currently active sources to detect pending mounts
+        active_srcs = set()
+        for m in vital_mounts:
+            if m.get("Name"):
+                active_srcs.add(m["Name"])
+        for m in bind_mounts:
+            if m.get("Source"):
+                active_srcs.add(m["Source"])
+
+        cfg_list = load_extra_mounts(name)
+        pending  = [e for e in cfg_list if e.get("source") not in active_srcs]
 
         items = []
-        if vital:
-            items.append({"kind": "header", "label": "VITAL VOLUMES",
-                          "hcolor": "cyan"})
-            for m in vital:
+        if vital_mounts:
+            items.append({"kind": "header", "label": "VITAL VOLUMES", "hcolor": "cyan"})
+            for m in vital_mounts:
                 items.append({"kind": "vital", "mount": m})
-        if extra:
-            items.append({"kind": "header", "label": "SHARED MOUNTS  (bind)",
-                          "hcolor": "yellow"})
-            for m in extra:
+        if bind_mounts:
+            items.append({"kind": "header", "label": "SHARED MOUNTS  (bind)", "hcolor": "yellow"})
+            for m in bind_mounts:
                 items.append({"kind": "extra", "mount": m})
-        return items
+        if pending:
+            items.append({"kind": "header", "label": "PENDING  (recreate to apply)", "hcolor": "yellow"})
+            for e in pending:
+                items.append({"kind": "configured", "entry": e})
+        return items, cfg_list
 
     def sel_indices(items):
         return [i for i, it in enumerate(items) if it["kind"] != "header"]
@@ -476,11 +542,11 @@ def show_volumes_ssh(scr, ssh, inst):
         title = f" Volumes: {name} "
         safe(lambda: scr.addstr(0, max(0, (w - len(title)) // 2), title, C_TITLE()))
         state_lbl = " ● RUNNING " if running else " ○ STOPPED "
-        state_c   = C_RUN()  if running else C_STOP()
+        state_c   = C_RUN() if running else C_STOP()
         safe(lambda: scr.addstr(0, max(0, w - len(state_lbl) - 1), state_lbl, state_c))
         separator(scr, 1, w)
-        safe(lambda: scr.addstr(2, _VCOL_KIND, "KIND",   C_HEAD()))
-        safe(lambda: scr.addstr(2, _VCOL_SRC,  "SOURCE", C_HEAD()))
+        safe(lambda: scr.addstr(2, _VCOL_KIND, "KIND",          C_HEAD()))
+        safe(lambda: scr.addstr(2, _VCOL_SRC,  "SOURCE",        C_HEAD()))
         if w > _VCOL_DEST + 6:
             safe(lambda: scr.addstr(2, _VCOL_DEST, "CONTAINER PATH", C_HEAD()))
         separator(scr, 3, w)
@@ -489,94 +555,188 @@ def show_volumes_ssh(scr, ssh, inst):
         sel_c = sidx[sel] if sidx and sel < len(sidx) else -1
 
         if not items:
-            safe(lambda: scr.addstr(4, _VCOL_KIND, "No mounts found", C_DIM()))
+            safe(lambda: scr.addstr(4, _VCOL_KIND, "No mounts found — [a] to add", C_DIM()))
         else:
             row = 4
             for i, item in enumerate(items):
                 if row >= h - 3:
                     break
                 if item["kind"] == "header":
-                    hc = C_TITLE() if item["hcolor"] == "cyan" else C_MSG()
+                    hc  = C_TITLE() if item["hcolor"] == "cyan" else C_MSG()
                     lbl = f" {item['label']} "
                     safe(lambda row=row, lbl=lbl, hc=hc:
                          scr.addstr(row, _VCOL_KIND, lbl, hc | curses.A_BOLD))
                     row += 1
                     continue
 
-                m        = item["mount"]
-                is_vital = item["kind"] == "vital"
-                src      = (m.get("Name", "") if is_vital
-                            else m.get("Source", ""))[:34]
-                dest     = m.get("Destination", "")[:28]
-                klabel   = "● core  " if is_vital else "○ shared"
+                if item["kind"] in ("vital", "extra"):
+                    m        = item["mount"]
+                    is_vital = item["kind"] == "vital"
+                    src      = (m.get("Name", "") if is_vital else m.get("Source", ""))[:34]
+                    dest     = m.get("Destination", "")[:28]
+                    klabel   = "● core  " if is_vital else "○ shared"
+                    if i == sel_c:
+                        safe(lambda row=row: scr.addstr(row, 0, " " * (w - 1), C_SEL()))
+                        safe(lambda row=row, k=klabel:
+                             scr.addstr(row, _VCOL_KIND, f"▶ {k}", C_SEL()))
+                        safe(lambda row=row, s=src:
+                             scr.addstr(row, _VCOL_SRC, s, C_SEL()))
+                        if w > _VCOL_DEST + 6:
+                            safe(lambda row=row, d=dest:
+                                 scr.addstr(row, _VCOL_DEST, d, C_SEL()))
+                    else:
+                        tc = C_RUN() if is_vital else C_MSG()
+                        safe(lambda row=row, k=klabel, tc=tc:
+                             scr.addstr(row, _VCOL_KIND, f"  {k}", tc))
+                        safe(lambda row=row, s=src, tc=tc:
+                             scr.addstr(row, _VCOL_SRC, s, tc))
+                        if w > _VCOL_DEST + 6:
+                            safe(lambda row=row, d=dest:
+                                 scr.addstr(row, _VCOL_DEST, d, C_DIM()))
 
-                if i == sel_c:
-                    safe(lambda row=row: scr.addstr(row, 0, " " * (w - 1), C_SEL()))
-                    safe(lambda row=row, k=klabel:
-                         scr.addstr(row, _VCOL_KIND, f"▶ {k}", C_SEL()))
-                    safe(lambda row=row, s=src:
-                         scr.addstr(row, _VCOL_SRC, s, C_SEL()))
-                    if w > _VCOL_DEST + 6:
-                        safe(lambda row=row, d=dest:
-                             scr.addstr(row, _VCOL_DEST, d, C_SEL()))
-                else:
-                    tc = C_RUN() if is_vital else C_MSG()
-                    safe(lambda row=row, k=klabel, tc=tc:
-                         scr.addstr(row, _VCOL_KIND, f"  {k}", tc))
-                    safe(lambda row=row, s=src, tc=tc:
-                         scr.addstr(row, _VCOL_SRC, s, tc))
-                    if w > _VCOL_DEST + 6:
-                        safe(lambda row=row, d=dest:
-                             scr.addstr(row, _VCOL_DEST, d, C_DIM()))
+                elif item["kind"] == "configured":
+                    e      = item["entry"]
+                    is_v   = e.get("vital", False)
+                    src    = e.get("source", "")[:34]
+                    dest   = e.get("dest",   "")[:28]
+                    klabel = "◆ cfg-vol" if is_v else "◇ cfg-bnd"
+                    if i == sel_c:
+                        safe(lambda row=row: scr.addstr(row, 0, " " * (w - 1), C_SEL()))
+                        safe(lambda row=row, k=klabel:
+                             scr.addstr(row, _VCOL_KIND, f"▶ {k}", C_SEL()))
+                        safe(lambda row=row, s=src:
+                             scr.addstr(row, _VCOL_SRC, s, C_SEL()))
+                        if w > _VCOL_DEST + 6:
+                            safe(lambda row=row, d=dest:
+                                 scr.addstr(row, _VCOL_DEST, d, C_SEL()))
+                    else:
+                        safe(lambda row=row, k=klabel:
+                             scr.addstr(row, _VCOL_KIND, f"  {k}", C_MSG()))
+                        safe(lambda row=row, s=src:
+                             scr.addstr(row, _VCOL_SRC, s, C_MSG()))
+                        if w > _VCOL_DEST + 6:
+                            safe(lambda row=row, d=dest:
+                                 scr.addstr(row, _VCOL_DEST, d, C_DIM()))
+
                 row += 1
 
         separator(scr, h - 2, w)
-        keys = "[↑↓] navigate  [d] delete core volume  [r] refresh  [q] back"
-        safe(lambda: scr.addstr(h - 1, 1, keys[:w - 2], C_DIM()))
+        parts = ["[↑↓] nav", "[a] add"]
+        if sidx:
+            parts.append("[d] delete")
+        if is_managed and not running:
+            parts.append("[R] recreate")
+        parts += ["[r] refresh", "[q] back"]
+        safe(lambda: scr.addstr(h - 1, 1, ("  ".join(parts))[:w - 2], C_DIM()))
         if msg:
             sm = f" {msg} "
             safe(lambda: scr.addstr(h - 1, max(1, w - len(sm) - 1), sm, C_MSG()))
         scr.refresh()
 
-    items = load_items()
+    items, cfg_list = load_items()
 
     while True:
         sidx = sel_indices(items)
         sel  = max(0, min(sel, len(sidx) - 1)) if sidx else 0
         draw(items)
-        msg = ""
+        msg  = ""
 
         key = scr.get_wch()
+
         if key == curses.KEY_UP:
             sel = max(0, sel - 1)
         elif key == curses.KEY_DOWN:
             sel = min(len(sidx) - 1, sel + 1) if sidx else 0
-        elif key in ('r', 'R'):
-            items = load_items()
-            msg   = "Refreshed"
+
+        elif key in ('r',):
+            items, cfg_list = load_items()
+            msg = "Refreshed"
+
         elif key in ('q', 'Q', '\x1b', 27):
             break
+
+        elif key in ('a', 'A'):
+            vtype = _volume_type_menu(scr)
+            if vtype is None:
+                continue
+
+            if vtype == "vital":
+                default = f"isaac-sim-{short_name}-" if short_name else ""
+                src = input_dialog(scr, "Add Vital Volume",
+                                   f"Volume name (e.g. {default}mydata):", max_len=60)
+                if not src:
+                    continue
+                dest = input_dialog(scr, "Add Vital Volume",
+                                    "Container mount path:", max_len=80)
+                if not dest:
+                    continue
+                ok = run_with_spinner(scr, f"Creating volume {src}…",
+                                      lambda s=src: create_volume(ssh, s))
+                if not ok:
+                    msg = f"Failed to create volume '{src}' on remote"
+                    continue
+                cfg_list.append({"vital": True, "source": src, "dest": dest})
+            else:
+                src = input_dialog(scr, "Add Shared Mount",
+                                   "Host path on remote server:", max_len=80)
+                if not src:
+                    continue
+                dest = input_dialog(scr, "Add Shared Mount",
+                                    "Container mount path:", max_len=80)
+                if not dest:
+                    continue
+                cfg_list.append({"vital": False, "source": src, "dest": dest})
+
+            save_extra_mounts(name, cfg_list)
+            items, cfg_list = load_items()
+            msg = "Volume added"
+            if not running and is_managed:
+                msg += " — [R] to recreate and apply"
+
+        elif key in ('R',) and is_managed and not running:
+            if confirm_dialog(scr, f"Recreate '{name}'? (docker rm + relaunch with config mounts)"):
+                ok, err = run_with_spinner(
+                    scr, f"Recreating {name}…",
+                    lambda sn=short_name: _recreate_container(ssh, sn))
+                items, cfg_list = load_items()
+                msg = f"Recreated {name}" if ok else f"Error: {err[:50]}"
+
         elif key in ('d', 'D') and sidx:
             item = items[sidx[sel]]
-            if item["kind"] != "vital":
-                msg = "Shared mounts are host paths — remove them from the container config"
-                continue
-            vol_name = item["mount"].get("Name", "")
-            if not vol_name:
-                msg = "No volume name found"
-                continue
-            if running:
-                msg = f"Stop the container first before deleting '{vol_name}'"
-                continue
-            if confirm_dialog(scr, f"Delete volume '{vol_name}'? This is permanent."):
-                _, _, code = run_cmd(ssh, f"docker volume rm {vol_name}", timeout=10)
-                if code == 0:
-                    items = load_items()
-                    sidx  = sel_indices(items)
-                    sel   = max(0, min(sel, len(sidx) - 1))
-                    msg   = f"Deleted {vol_name}"
-                else:
-                    msg = f"Failed to delete {vol_name} (in use?)"
+
+            if item["kind"] == "extra":
+                msg = "Active bind mounts — remove from config then recreate to detach"
+
+            elif item["kind"] == "vital":
+                vol_name = item["mount"].get("Name", "")
+                if not vol_name:
+                    msg = "No volume name found"
+                elif running:
+                    msg = f"Stop the container first before deleting '{vol_name}'"
+                elif confirm_dialog(scr, f"Delete volume '{vol_name}'? This is permanent."):
+                    _, _, code = run_cmd(ssh, f"docker volume rm {vol_name}", timeout=10)
+                    if code == 0:
+                        items, cfg_list = load_items()
+                        sidx = sel_indices(items)
+                        sel  = max(0, min(sel, len(sidx) - 1))
+                        msg  = f"Deleted {vol_name}"
+                    else:
+                        msg = f"Failed to delete {vol_name} (in use?)"
+
+            elif item["kind"] == "configured":
+                e   = item["entry"]
+                src = e.get("source", "")
+                is_v = e.get("vital", False)
+                if confirm_dialog(scr, f"Remove '{src}' from config?"):
+                    cfg_list = [x for x in cfg_list if x.get("source") != src]
+                    save_extra_mounts(name, cfg_list)
+                    if is_v and not running:
+                        if confirm_dialog(scr, f"Also delete Docker volume '{src}' on remote?"):
+                            run_cmd(ssh, f"docker volume rm {src}", timeout=10)
+                    items, cfg_list = load_items()
+                    sidx = sel_indices(items)
+                    sel  = max(0, min(sel, len(sidx) - 1))
+                    msg  = f"Removed '{src}' from config"
 
 
 # ── Main instance list ─────────────────────────────────────────────────────────
