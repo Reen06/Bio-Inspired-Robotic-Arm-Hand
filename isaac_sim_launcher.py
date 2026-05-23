@@ -298,6 +298,62 @@ class IsaacSimLauncher:
                            ipady=7, padx=(8, 0))
         self.stop_btn.configure(state="disabled")
 
+        # ── Managed Instances panel (additive — does not affect the Run/Stop flow) ──
+        self._instances_data   = []   # list of dicts from backend.list_instances
+        self._inst_ssh         = None
+        self._inst_tunnel_stop = None
+
+        inst_frame = tk.Frame(self.root, bg=BG2)
+        inst_frame.pack(fill="x", padx=20, pady=(0, 6))
+
+        hdr2 = tk.Frame(inst_frame, bg=BG2)
+        hdr2.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(hdr2, text="Managed Instances",
+                 font=("Segoe UI", 10, "bold"),
+                 bg=BG2, fg=SUBTLE).pack(side="left")
+        tk.Label(hdr2,
+                 text="(from Isaac-Sim-Manager on server — independent of Run button above)",
+                 font=("Segoe UI", 8), bg=BG2, fg=MUTED).pack(side="left", padx=6)
+
+        inst_body = tk.Frame(inst_frame, bg=BG2)
+        inst_body.pack(fill="x", padx=8, pady=(0, 6))
+
+        lb_frame = tk.Frame(inst_body, bg=BG2)
+        lb_frame.pack(side="left", fill="both", expand=True)
+        self._inst_lb = tk.Listbox(
+            lb_frame,
+            height=4,
+            font=("Consolas", 9),
+            bg=BG3, fg=FG,
+            selectbackground=BLUE, selectforeground=BG,
+            relief="flat", bd=4,
+            activestyle="none",
+        )
+        inst_sb = ttk.Scrollbar(lb_frame, command=self._inst_lb.yview)
+        self._inst_lb.configure(yscrollcommand=inst_sb.set)
+        inst_sb.pack(side="right", fill="y")
+        self._inst_lb.pack(fill="both", expand=True)
+
+        btn2 = tk.Frame(inst_body, bg=BG2)
+        btn2.pack(side="right", padx=(8, 0), fill="y")
+        for label, cmd, clr in [
+            ("↺ Refresh",  self._inst_refresh,  BLUE),
+            ("⚡ Connect",  self._inst_connect,  TEAL),
+            ("▶ Start",    self._inst_start,    GREEN),
+            ("■ Stop",     self._inst_stop,     RED),
+        ]:
+            tk.Button(btn2, text=label,
+                      font=("Segoe UI", 9, "bold"),
+                      bg=clr, fg=BG, relief="flat",
+                      activebackground=YELLOW, cursor="hand2",
+                      command=cmd
+                      ).pack(fill="x", pady=2, ipady=2)
+
+        self._inst_status = tk.Label(
+            inst_frame, text="  Click ↺ Refresh to load instances",
+            font=("Segoe UI", 8), bg=BG2, fg=MUTED, anchor="w")
+        self._inst_status.pack(fill="x", padx=8, pady=(0, 4))
+
         # log area
         lf = tk.Frame(self.root, bg=BG)
         lf.pack(fill="both", expand=True, padx=20, pady=(0, 14))
@@ -318,6 +374,153 @@ class IsaacSimLauncher:
             self.log.tag_configure(tag, foreground=color)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Managed Instances helpers ─────────────────────────────
+
+    def _inst_set_status(self, text, color=None):
+        def _do():
+            self._inst_status.configure(
+                text=f"  {text}",
+                fg=color or MUTED)
+        self.root.after(0, _do)
+
+    def _inst_get_or_connect_ssh(self):
+        """Return a live SSH client for instance management, reconnecting if needed."""
+        try:
+            if self._inst_ssh and self._inst_ssh.get_transport() and \
+                    self._inst_ssh.get_transport().is_active():
+                return self._inst_ssh
+        except Exception:
+            pass
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(SSH_HOST, username=self.username,
+                       password=self.password, timeout=15)
+        self._inst_ssh = client
+        return client
+
+    def _inst_refresh(self):
+        def _worker():
+            try:
+                from backend import list_instances
+                ssh = self._inst_get_or_connect_ssh()
+                instances = list_instances(ssh)
+                self._instances_data = instances
+
+                def _update():
+                    self._inst_lb.delete(0, "end")
+                    if not instances:
+                        self._inst_lb.insert("end", "  (no containers found)")
+                    for inst in instances:
+                        state = inst["state"].upper()
+                        tag   = "(legacy)" if inst["is_legacy"] else ""
+                        line  = f"  {inst['name']:<28} {state:<10} {tag}"
+                        self._inst_lb.insert("end", line)
+                    self._inst_set_status(
+                        f"{len(instances)} container(s) found — "
+                        f"{sum(1 for i in instances if i['state'].lower()=='running')} running",
+                        SUBTLE)
+                self.root.after(0, _update)
+            except Exception as e:
+                self._inst_set_status(f"Refresh failed: {e}", RED)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._inst_set_status("Refreshing…", YELLOW)
+
+    def _inst_selected(self):
+        idx = self._inst_lb.curselection()
+        if not idx or not self._instances_data:
+            return None
+        i = idx[0]
+        return self._instances_data[i] if i < len(self._instances_data) else None
+
+    def _inst_connect(self):
+        inst = self._inst_selected()
+        if not inst:
+            self._inst_set_status("Select an instance first", YELLOW)
+            return
+        if inst["state"].lower() != "running":
+            self._inst_set_status("Instance is not running — start it first", RED)
+            return
+
+        def _worker():
+            try:
+                from backend import run_tunnel_server
+                # Close existing managed-instance tunnels
+                if self._inst_tunnel_stop:
+                    self._inst_tunnel_stop.set()
+                stop_evt  = threading.Event()
+                self._inst_tunnel_stop = stop_evt
+
+                ssh_tun = paramiko.SSHClient()
+                ssh_tun.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh_tun.connect(SSH_HOST, username=self.username,
+                                password=self.password, timeout=15)
+                transport = ssh_tun.get_transport()
+
+                rest_port   = inst["rest_port"]
+                webrtc_port = inst["webrtc_port"]
+                for lp, rp in ((rest_port, rest_port), (webrtc_port, webrtc_port)):
+                    threading.Thread(
+                        target=run_tunnel_server,
+                        args=(lp, rp, transport, stop_evt),
+                        daemon=True
+                    ).start()
+
+                self._inst_set_status(
+                    f"Tunnels active → localhost:{rest_port} (REST)  "
+                    f"localhost:{webrtc_port} (WebRTC)  —  {inst['name']}",
+                    GREEN)
+                self._print(
+                    f"\n⚡ Connected to {inst['name']}  "
+                    f"(REST ::{rest_port}  WebRTC ::{webrtc_port})", "ok")
+            except Exception as e:
+                self._inst_set_status(f"Tunnel error: {e}", RED)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._inst_set_status(f"Setting up tunnels to {inst['name']}…", YELLOW)
+
+    def _inst_start(self):
+        inst = self._inst_selected()
+        if not inst:
+            self._inst_set_status("Select an instance first", YELLOW)
+            return
+
+        def _worker():
+            try:
+                from backend import start_container, start_managed_instance
+                ssh = self._inst_get_or_connect_ssh()
+                if inst["is_managed"] or inst["is_legacy"]:
+                    start_container(ssh, inst["name"])
+                else:
+                    start_managed_instance(
+                        ssh, inst["name"].removeprefix("isaac-sim-"))
+                self._inst_set_status(f"Started {inst['name']}", GREEN)
+                self._inst_refresh()
+            except Exception as e:
+                self._inst_set_status(f"Start failed: {e}", RED)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._inst_set_status(f"Starting {inst['name']}…", YELLOW)
+
+    def _inst_stop(self):
+        inst = self._inst_selected()
+        if not inst:
+            self._inst_set_status("Select an instance first", YELLOW)
+            return
+
+        def _worker():
+            try:
+                from backend import stop_container
+                ssh = self._inst_get_or_connect_ssh()
+                stop_container(ssh, inst["name"])
+                self._inst_set_status(f"Stopped {inst['name']}", SUBTLE)
+                self._inst_refresh()
+            except Exception as e:
+                self._inst_set_status(f"Stop failed: {e}", RED)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._inst_set_status(f"Stopping {inst['name']}…", YELLOW)
 
     # ── helpers ───────────────────────────────────────────────
     def _print(self, msg, tag=""):
@@ -582,7 +785,9 @@ class IsaacSimLauncher:
     # ── window close ──────────────────────────────────────────
     def _on_close(self):
         self.stop_event.set()
-        for client in (self.ssh_cmd, self.ssh_tun):
+        if self._inst_tunnel_stop:
+            self._inst_tunnel_stop.set()
+        for client in (self.ssh_cmd, self.ssh_tun, self._inst_ssh):
             if client:
                 try:
                     client.close()
@@ -592,6 +797,18 @@ class IsaacSimLauncher:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = IsaacSimLauncher(root)
-    root.mainloop()
+    import argparse
+    parser = argparse.ArgumentParser(description="Isaac Sim Launcher")
+    parser.add_argument("--tui", "-t", action="store_true",
+                        help="Run as terminal TUI instead of GUI")
+    args = parser.parse_args()
+
+    if args.tui:
+        # TUI mode — instance picker backed by backend.py
+        # Import here so the GUI path never requires paramiko to be installed
+        from tui import run_tui
+        run_tui()
+    else:
+        root = tk.Tk()
+        app = IsaacSimLauncher(root)
+        root.mainloop()

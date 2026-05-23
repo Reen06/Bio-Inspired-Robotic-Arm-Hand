@@ -94,11 +94,63 @@ python isaac_sim_launcher.py
 
 ---
 
+## Managed Instances panel (new — backwards compatible)
+
+The GUI now has a **Managed Instances** section below the Run/Stop buttons. This panel talks to the **Isaac-Sim-Manager** running on the server and lets you see and control named instances created by that tool.
+
+**The original Run / Stop buttons are unchanged.** If you just want to start a fresh `isaac-sim` container the old way, ignore this panel entirely.
+
+| Button | Action |
+|--------|--------|
+| **↺ Refresh** | SSH to the server and list all Isaac Sim containers |
+| **⚡ Connect** | Set up SSH tunnels to the selected running instance |
+| **▶ Start** | Start the selected stopped container |
+| **■ Stop** | Stop the selected running container |
+
+---
+
+## TUI mode
+
+If you prefer a terminal interface (or are running headless), add `--tui`:
+
+```bash
+python isaac_sim_launcher.py --tui
+```
+
+Keyboard controls are the same as Isaac-Sim-Manager: `↑↓` navigate, `Enter` for actions, `n` to create a new managed instance, `r` to refresh, `q` to quit. Selecting **Connect** sets up SSH tunnels and shows the ports.
+
+---
+
+## Linux Alias Setup
+
+To launch the TUI with a short `isaac` command, add an alias to your `~/.bashrc`:
+
+```bash
+echo "alias isaac='python3 /home/$(whoami)/Engineering/Projects/Isaac_Sim_Launcher/isaac_sim_launcher.py --tui'" >> ~/.bashrc
+source ~/.bashrc
+```
+
+After that you can start the TUI from any terminal with:
+
+```bash
+isaac
+```
+
+> **Note:** The alias uses an absolute path. If you move the repo, update the path in `~/.bashrc` to match.  
+> **Dependencies:** Make sure `paramiko` and `cryptography` are installed for the Python interpreter on your `PATH`:
+> ```bash
+> pip install paramiko cryptography
+> ```
+
+---
+
 ## File Overview
 
 ```
 Launch IsaacSim.bat     ← Double-click this to launch the GUI
-isaac_sim_launcher.py   ← The launcher GUI (Python source)
+isaac_sim_launcher.py   ← Launcher GUI + --tui entry point (Python source)
+backend.py              ← Shared SSH/Docker logic (used by GUI panel + TUI)
+tui.py                  ← Curses TUI (used by --tui mode)
 isaac_sim_creds.json    ← Auto-generated saved credentials (password is encrypted)
 .isaac_sim.key          ← Auto-generated Fernet encryption key (hidden file)
 README.md               ← This file
