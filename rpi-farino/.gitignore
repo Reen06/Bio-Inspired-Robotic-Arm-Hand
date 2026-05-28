@@ -1,0 +1,10 @@
+*.img
+*.img.xz
+*.qcow2
+*.tar.gz
+ros2_ws/fairino_sdk/__pycache__/
+ros2_ws/fairino_sdk/build/
+ros2_ws/src/farino_wave/farino_wave/__pycache__/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
